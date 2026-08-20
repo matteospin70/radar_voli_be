@@ -68,23 +68,14 @@ app.get('/api/airports', async (req, res) => {
   if (q.length < 2) return res.json([]);
 
   try {
-    const url = new URL('https://autocomplete.travelpayouts.com/places2');
-    url.searchParams.set('term', q);
-    url.searchParams.set('locale', 'it');
-    url.searchParams.append('types[]', 'airport');
+    let airports = await searchAirportsAutocomplete(q, 'it');
 
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`Autocomplete ha risposto ${resp.status}`);
-    const results = await resp.json();
-
-    const airports = (results || [])
-      .filter(r => r.type === 'airport' && r.code)
-      .map(r => ({
-        code: r.code,
-        name: r.name,
-        cityName: r.city_name || r.name,
-        countryName: r.country_name || ''
-      }));
+    // L'indice di ricerca di questa API sembra basato sui nomi in inglese: un termine
+    // come "Torino" può non trovare nulla anche se l'aeroporto esiste come "Turin".
+    // Se la ricerca in italiano non trova nulla, riproviamo in inglese.
+    if (airports.length === 0) {
+      airports = await searchAirportsAutocomplete(q, 'en');
+    }
 
     res.json(airports);
   } catch (err) {
@@ -92,6 +83,26 @@ app.get('/api/airports', async (req, res) => {
     res.json([]); // fallisce in modo silenzioso: l'utente può sempre digitare il codice a mano
   }
 });
+
+async function searchAirportsAutocomplete(term, locale) {
+  const url = new URL('https://autocomplete.travelpayouts.com/places2');
+  url.searchParams.set('term', term);
+  url.searchParams.set('locale', locale);
+  url.searchParams.append('types[]', 'airport');
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Autocomplete ha risposto ${resp.status}`);
+  const results = await resp.json();
+
+  return (results || [])
+    .filter(r => r.type === 'airport' && r.code)
+    .map(r => ({
+      code: r.code,
+      name: r.name,
+      cityName: r.city_name || r.name,
+      countryName: r.country_name || ''
+    }));
+}
 
 // Elenco dei monitoraggi
 app.get('/api/monitors', (req, res) => {
