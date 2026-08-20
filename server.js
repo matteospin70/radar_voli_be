@@ -26,11 +26,25 @@ if (!TP_TOKEN) {
   console.warn('[ATTENZIONE] TRAVELPAYOUTS_TOKEN non impostato: i monitoraggi con fonte "travelpayouts" falliranno.');
 }
 
-// Costruisce un link di ricerca Google Flights per la rotta/data trovata (usato da entrambe le fonti)
-function buildBookingUrl(origin, destination, departureDateISO) {
+// Link di ricerca Google Flights (usato per la fonte "serpapi")
+function buildGoogleFlightsUrl(origin, destination, departureDateISO) {
   const dateStr = departureDateISO.slice(0, 10); // YYYY-MM-DD
   const query = encodeURIComponent(`Flights from ${origin} to ${destination} on ${dateStr}`);
   return `https://www.google.com/travel/flights?q=${query}`;
+}
+
+// Link di ricerca Aviasales (usato per la fonte "travelpayouts", stessa fonte del prezzo mostrato)
+function buildAviasalesUrl(origin, destination, departureDateISO, passengers) {
+  const d = new Date(departureDateISO);
+  const ddmm = String(d.getDate()).padStart(2, '0') + String(d.getMonth() + 1).padStart(2, '0');
+  const pax = Math.max(1, passengers || 1);
+  return `https://www.aviasales.com/search/${origin}${ddmm}${destination}${pax}`;
+}
+
+function buildBookingUrl(source, origin, destination, departureDateISO, passengers) {
+  return source === 'travelpayouts'
+    ? buildAviasalesUrl(origin, destination, departureDateISO, passengers)
+    : buildGoogleFlightsUrl(origin, destination, departureDateISO);
 }
 
 // ---------- DB (file JSON) ----------
@@ -52,7 +66,7 @@ app.get('/api/monitors', (req, res) => {
 
 // Nuovo monitoraggio
 app.post('/api/monitors', async (req, res) => {
-  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDays, source } = req.body;
+  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDays, source, maxStops } = req.body;
 
   if (!from || !to || !start || !end || !maxPrice) {
     return res.status(400).json({ error: 'Campi obbligatori mancanti (from, to, start, end, maxPrice).' });
@@ -60,12 +74,16 @@ app.post('/api/monitors', async (req, res) => {
 
   const dataSource = source === 'travelpayouts' ? 'travelpayouts' : 'serpapi'; // default: serpapi
   const isRoundTrip = tripType === 'round_trip';
+  const stops = Number.isFinite(Number(maxStops)) ? Math.max(0, Number(maxStops)) : 0; // default: solo diretti
 
   if (isRoundTrip && (!stayDays || stayDays < 1)) {
     return res.status(400).json({ error: 'Per andata/ritorno indica i giorni di soggiorno (stayDays >= 1).' });
   }
   if (isRoundTrip && dataSource === 'travelpayouts') {
     return res.status(400).json({ error: 'L\'andata/ritorno è al momento supportata solo con la fonte "serpapi".' });
+  }
+  if (stops > 0 && dataSource === 'travelpayouts') {
+    return res.status(400).json({ error: 'Gli scali sono al momento supportati solo con la fonte "serpapi" (Travelpayouts /prices/direct copre solo voli diretti).' });
   }
 
   const monitor = {
@@ -80,12 +98,14 @@ app.post('/api/monitors', async (req, res) => {
     source: dataSource,     // 'travelpayouts' | 'serpapi'
     tripType: isRoundTrip ? 'round_trip' : 'one_way',
     stayDays: isRoundTrip ? Number(stayDays) : null,
+    maxStops: stops,        // 0 = solo voli diretti, >0 = scali ammessi
     status: 'waiting',      // 'waiting' | 'found'
     lastChecked: null,
     datesSampled: [],
     foundPrice: null,
     foundDate: null,
     foundReturnDate: null,
+    foundStops: null,
     airline: null,
     airlineName: null,
     bookingUrl: null,
@@ -200,9 +220,8 @@ function sampleDates(startStr, endStr, maxSamples) {
 }
 
 // Interroga Google Flights (via SerpApi) per una singola data (e, se andata/ritorno,
-// una data di rientro) e restituisce solo le offerte di voli diretti (senza scali).
-// Per l'andata/ritorno, richiede voli diretti su ENTRAMBE le tratte.
-async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers, returnDateStr) {
+// una data di rientro) e restituisce le offerte con al massimo maxStops scali per tratta.
+async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers, returnDateStr, maxStops) {
   const url = new URL('https://serpapi.com/search.json');
   url.searchParams.set('engine', 'google_flights');
   url.searchParams.set('departure_id', origin);
@@ -229,32 +248,35 @@ async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers
   }
 
   const all = [...(json.best_flights || []), ...(json.other_flights || [])];
+  const maxLegsPerTrip = returnDateStr ? (maxStops + 1) * 2 : (maxStops + 1);
+  // "flights" contiene 1 elemento per tratta di volo; con N scali ammessi ci aspettiamo
+  // fino a (N+1) tratte per direzione (raddoppiate per l'andata/ritorno).
 
   if (!returnDateStr) {
-    // Sola andata: un'offerta è diretta se ha una sola tratta.
-    const direct = all.filter(offer => (offer.flights || []).length === 1);
-    return direct.map(offer => {
+    const matching = all.filter(offer => (offer.flights || []).length <= maxLegsPerTrip);
+    return matching.map(offer => {
       const leg = offer.flights[0];
+      const lastLeg = offer.flights[offer.flights.length - 1];
       return {
         price: offer.price,
         airline: leg.airline,
+        stops: offer.flights.length - 1,
         departure_at: `${dateStr}T${(leg.departure_airport?.time || '00:00').split(' ').pop()}:00Z`,
         return_at: null
       };
     });
   }
 
-  // Andata e ritorno: per un'offerta round-trip diretta su entrambe le tratte,
-  // SerpApi restituisce tipicamente 2 segmenti in "flights" (uno per tratta).
-  // NOTA: questo comportamento non è stato verificato con una chiamata reale;
-  // se la logica sotto scarta troppe/tutte le offerte, va rivista guardando
-  // la risposta JSON effettiva.
-  const direct = all.filter(offer => (offer.flights || []).length === 2);
-  return direct.map(offer => {
+  // Andata e ritorno: NOTA — questo comportamento non è stato verificato con una chiamata
+  // reale; se la logica sotto scarta troppe/tutte le offerte, va rivista guardando la
+  // risposta JSON effettiva (in particolare come SerpApi separa andata e ritorno in "flights").
+  const matching = all.filter(offer => (offer.flights || []).length <= maxLegsPerTrip);
+  return matching.map(offer => {
     const outboundLeg = offer.flights[0];
     return {
       price: offer.price,
       airline: outboundLeg.airline,
+      stops: Math.max(0, Math.floor(offer.flights.length / 2) - 1),
       departure_at: `${dateStr}T${(outboundLeg.departure_airport?.time || '00:00').split(' ').pop()}:00Z`,
       return_at: returnDateStr
     };
@@ -273,7 +295,7 @@ async function checkSerpApi(monitor) {
       ret.setDate(ret.getDate() + monitor.stayDays);
       returnDateStr = ret.toISOString().slice(0, 10);
     }
-    const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr);
+    const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr, monitor.maxStops || 0);
     for (const offer of offers) {
       if (!best || offer.price < best.price) best = offer;
     }
@@ -297,22 +319,26 @@ async function checkMonitor(monitor) {
       monitor.foundPrice = best.price;
       monitor.foundDate = best.departure_at?.slice(0, 10) || null;
       monitor.foundReturnDate = best.return_at || null;
+      monitor.foundStops = best.stops ?? 0;
       monitor.airline = best.airline || null;
       monitor.airlineName = best.airline || 'Compagnia sconosciuta';
       monitor.bookingUrl = best.departure_at
-        ? buildBookingUrl(monitor.from, monitor.to, best.departure_at)
+        ? buildBookingUrl(monitor.source, monitor.from, monitor.to, best.departure_at, monitor.pax)
         : null;
 
       if (!wasAlreadyFound) {
         const tripLabel = monitor.tripType === 'round_trip'
           ? `andata ${monitor.foundDate} / ritorno ${monitor.foundReturnDate}`
           : `partenza ${monitor.foundDate}, sola andata`;
-        const sourceLabel = monitor.source === 'travelpayouts' ? 'Travelpayouts (cache)' : 'Google Flights (live)';
+        const stopsLabel = monitor.foundStops === 0 ? 'diretto' : `${monitor.foundStops} scalo/i`;
+        const sourceNote = monitor.source === 'travelpayouts'
+          ? 'Fonte: Travelpayouts, dati in cache (possono avere 2-7 giorni di ritardo rispetto al mercato reale).'
+          : `Fonte: Google Flights (live). Controllate ${monitor.datesSampled.length} date campione nel periodo, non ogni giorno.`;
         await notifyTelegram(
           `✈️ Trovato ${monitor.from} → ${monitor.to} a €${best.price} con ${monitor.airlineName} ` +
-          `(${tripLabel}). Tetto impostato: €${monitor.maxPrice}. Fonte: ${sourceLabel}. ` +
+          `(${tripLabel}, ${stopsLabel}). Tetto impostato: €${monitor.maxPrice}. ` +
           `Verifica e prenota qui: ${monitor.bookingUrl}\n` +
-          `Ricorda: prezzo del solo biglietto, non include eventuali bagagli in stiva.`
+          `${sourceNote} Il prezzo del solo biglietto non include eventuali bagagli in stiva.`
         );
       }
     } else {
