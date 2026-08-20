@@ -7,27 +7,26 @@ import { JSONFilePreset } from 'lowdb/node';
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const TP_TOKEN = process.env.TRAVELPAYOUTS_TOKEN;
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Controllo una volta al giorno di default: con Google Flights (a differenza di
-// Travelpayouts) ogni data interrogata è una ricerca a pagamento, quindi qui
-// il default è più conservativo per restare nel piano gratuito di SerpApi.
+// Controllo una volta al giorno di default (pensato per il budget SerpApi;
+// se usi solo Travelpayouts puoi tranquillamente abbassarlo, es. a 6).
 const CHECK_INTERVAL_HOURS = parseInt(process.env.CHECK_INTERVAL_HOURS || '24', 10);
 
-// Quante date campionare all'interno del periodo indicato in ogni monitoraggio,
-// ad ogni controllo. Più alto = copertura migliore del periodo, ma più ricerche
-// consumate. Con MAX_DATE_SAMPLES=3 e un controllo al giorno, un monitoraggio
-// consuma ~90 ricerche/mese; il piano gratuito SerpApi ne offre circa 100-250/mese
-// (verifica il numero esatto sul tuo account) — quindi tienilo basso se hai più
-// di un monitoraggio attivo insieme.
+// Quante date campionare nel periodo per ogni monitoraggio con fonte SerpApi
+// (con Travelpayouts non serve: quell'endpoint copre già un mese intero in 1 chiamata).
 const MAX_DATE_SAMPLES = parseInt(process.env.MAX_DATE_SAMPLES || '3', 10);
 
 if (!SERPAPI_KEY) {
-  console.warn('[ATTENZIONE] SERPAPI_KEY non impostato: le chiamate falliranno.');
+  console.warn('[ATTENZIONE] SERPAPI_KEY non impostato: i monitoraggi con fonte "serpapi" falliranno.');
+}
+if (!TP_TOKEN) {
+  console.warn('[ATTENZIONE] TRAVELPAYOUTS_TOKEN non impostato: i monitoraggi con fonte "travelpayouts" falliranno.');
 }
 
-// Costruisce un link di ricerca Google Flights per la rotta/data trovata
+// Costruisce un link di ricerca Google Flights per la rotta/data trovata (usato da entrambe le fonti)
 function buildBookingUrl(origin, destination, departureDateISO) {
   const dateStr = departureDateISO.slice(0, 10); // YYYY-MM-DD
   const query = encodeURIComponent(`Flights from ${origin} to ${destination} on ${dateStr}`);
@@ -49,15 +48,20 @@ app.get('/api/monitors', (req, res) => {
 
 // Nuovo monitoraggio
 app.post('/api/monitors', async (req, res) => {
-  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDays } = req.body;
+  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDays, source } = req.body;
 
   if (!from || !to || !start || !end || !maxPrice) {
     return res.status(400).json({ error: 'Campi obbligatori mancanti (from, to, start, end, maxPrice).' });
   }
 
+  const dataSource = source === 'travelpayouts' ? 'travelpayouts' : 'serpapi'; // default: serpapi
   const isRoundTrip = tripType === 'round_trip';
+
   if (isRoundTrip && (!stayDays || stayDays < 1)) {
     return res.status(400).json({ error: 'Per andata/ritorno indica i giorni di soggiorno (stayDays >= 1).' });
+  }
+  if (isRoundTrip && dataSource === 'travelpayouts') {
+    return res.status(400).json({ error: 'L\'andata/ritorno è al momento supportata solo con la fonte "serpapi".' });
   }
 
   const monitor = {
@@ -69,6 +73,7 @@ app.post('/api/monitors', async (req, res) => {
     pax: pax || 1,
     bags: bags || 0,
     maxPrice: Number(maxPrice),
+    source: dataSource,     // 'travelpayouts' | 'serpapi'
     tripType: isRoundTrip ? 'round_trip' : 'one_way',
     stayDays: isRoundTrip ? Number(stayDays) : null,
     status: 'waiting',      // 'waiting' | 'found'
@@ -111,7 +116,57 @@ app.post('/api/monitors/check-now', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ---------- LOGICA DI CONTROLLO PREZZI (SerpApi / Google Flights) ----------
+// ---------- LOGICA DI CONTROLLO PREZZI ----------
+
+// Genera la lista di "YYYY-MM" compresi tra due date (Travelpayouts vuole il mese)
+function monthsBetween(startStr, endStr) {
+  const start = new Date(startStr);
+  const end = new Date(endStr);
+  const months = [];
+  let cur = new Date(start.getFullYear(), start.getMonth(), 1);
+  while (cur <= end) {
+    months.push(`${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}`);
+    cur.setMonth(cur.getMonth() + 1);
+  }
+  return months;
+}
+
+// Fonte 1: Travelpayouts — gratuita, illimitata, ma dati in cache (2-7 giorni),
+// quindi può mancare occasioni reali disponibili solo in ricerca live (vedi i test fatti).
+async function checkTravelpayouts(monitor) {
+  const months = monthsBetween(monitor.start, monitor.end);
+  let best = null;
+
+  for (const month of months) {
+    const url = new URL('https://api.travelpayouts.com/v1/prices/direct');
+    url.searchParams.set('origin', monitor.from);
+    url.searchParams.set('destination', monitor.to);
+    url.searchParams.set('depart_date', month);
+    url.searchParams.set('currency', 'eur'); // senza questo, i prezzi arrivano in rubli (RUB) per default
+    url.searchParams.set('token', TP_TOKEN);
+
+    const resp = await fetch(url, { headers: { 'X-Access-Token': TP_TOKEN } });
+    if (!resp.ok) throw new Error(`Travelpayouts ha risposto ${resp.status}`);
+    const json = await resp.json();
+    if (!json.success) continue;
+
+    const entries = json.data?.[monitor.to];
+    if (!entries) continue;
+
+    for (const offer of Object.values(entries)) {
+      const depDate = offer.departure_at?.slice(0, 10);
+      if (!depDate || depDate < monitor.start || depDate > monitor.end) continue;
+      if (!best || offer.price < best.price) {
+        best = { price: offer.price, airline: offer.airline, departure_at: offer.departure_at, return_at: null };
+      }
+    }
+  }
+
+  return { best, datesSampled: months.map(m => `${m} (intero mese)`) };
+}
+
+// Fonte 2: SerpApi / Google Flights — dati live, ma a consumo (vedi budget nel README);
+// campiona alcune date nel periodo invece di coprirlo tutto.
 
 // Sceglie fino a maxSamples date distribuite uniformemente nel periodo indicato,
 // per non dover interrogare ogni singolo giorno (ogni data = 1 ricerca a pagamento).
@@ -202,27 +257,35 @@ async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers
   });
 }
 
+async function checkSerpApi(monitor) {
+  const dates = sampleDates(monitor.start, monitor.end, MAX_DATE_SAMPLES);
+  const isRoundTrip = monitor.tripType === 'round_trip';
+  let best = null;
+
+  for (const dateStr of dates) {
+    let returnDateStr = null;
+    if (isRoundTrip) {
+      const ret = new Date(dateStr);
+      ret.setDate(ret.getDate() + monitor.stayDays);
+      returnDateStr = ret.toISOString().slice(0, 10);
+    }
+    const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr);
+    for (const offer of offers) {
+      if (!best || offer.price < best.price) best = offer;
+    }
+  }
+
+  return { best, datesSampled: dates };
+}
+
 async function checkMonitor(monitor) {
   try {
-    const dates = sampleDates(monitor.start, monitor.end, MAX_DATE_SAMPLES);
-    const isRoundTrip = monitor.tripType === 'round_trip';
-    let best = null;
-
-    for (const dateStr of dates) {
-      let returnDateStr = null;
-      if (isRoundTrip) {
-        const ret = new Date(dateStr);
-        ret.setDate(ret.getDate() + monitor.stayDays);
-        returnDateStr = ret.toISOString().slice(0, 10);
-      }
-      const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr);
-      for (const offer of offers) {
-        if (!best || offer.price < best.price) best = offer;
-      }
-    }
+    const { best, datesSampled } = monitor.source === 'travelpayouts'
+      ? await checkTravelpayouts(monitor)
+      : await checkSerpApi(monitor);
 
     monitor.lastChecked = new Date().toISOString();
-    monitor.datesSampled = dates; // utile per capire quali date sono state effettivamente controllate
+    monitor.datesSampled = datesSampled; // utile per capire cosa è stato effettivamente controllato
 
     if (best && best.price <= monitor.maxPrice) {
       const wasAlreadyFound = monitor.status === 'found';
@@ -237,22 +300,22 @@ async function checkMonitor(monitor) {
         : null;
 
       if (!wasAlreadyFound) {
-        const tripLabel = isRoundTrip
+        const tripLabel = monitor.tripType === 'round_trip'
           ? `andata ${monitor.foundDate} / ritorno ${monitor.foundReturnDate}`
           : `partenza ${monitor.foundDate}, sola andata`;
+        const sourceLabel = monitor.source === 'travelpayouts' ? 'Travelpayouts (cache)' : 'Google Flights (live)';
         await notifyTelegram(
           `✈️ Trovato ${monitor.from} → ${monitor.to} a €${best.price} con ${monitor.airlineName} ` +
-          `(${tripLabel}). Tetto impostato: €${monitor.maxPrice}. ` +
+          `(${tripLabel}). Tetto impostato: €${monitor.maxPrice}. Fonte: ${sourceLabel}. ` +
           `Verifica e prenota qui: ${monitor.bookingUrl}\n` +
-          `Nota: abbiamo controllato solo alcune date campione nel periodo (${dates.join(', ')}), ` +
-          `non ogni singolo giorno, e il prezzo del solo biglietto non include eventuali bagagli in stiva.`
+          `Ricorda: prezzo del solo biglietto, non include eventuali bagagli in stiva.`
         );
       }
     } else {
       monitor.status = 'waiting';
     }
   } catch (err) {
-    console.error(`Errore controllando ${monitor.from}->${monitor.to}:`, err.message);
+    console.error(`Errore controllando ${monitor.from}->${monitor.to} (${monitor.source}):`, err.message);
   }
 
   await db.write();
