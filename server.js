@@ -15,6 +15,36 @@ if (!TP_TOKEN) {
   console.warn('[ATTENZIONE] TRAVELPAYOUTS_TOKEN non impostato: le chiamate falliranno.');
 }
 
+// Marker affiliato Travelpayouts (opzionale): se lo imposti, i link di acquisto
+// vengono tracciati sul tuo account. Senza, i link funzionano comunque lo stesso.
+const AVIASALES_MARKER = process.env.AVIASALES_MARKER || '';
+
+// ---------- MAPPA COMPAGNIE AEREE (nome per esteso a partire dal codice IATA) ----------
+let airlineMap = {};
+async function loadAirlines() {
+  try {
+    const resp = await fetch('https://api.travelpayouts.com/data/en/airlines.json');
+    const list = await resp.json();
+    for (const a of list) {
+      if (a.iata) airlineMap[a.iata] = a.name;
+    }
+    console.log(`Caricate ${Object.keys(airlineMap).length} compagnie aeree.`);
+  } catch (err) {
+    console.warn('Impossibile caricare la lista compagnie aeree:', err.message);
+  }
+}
+loadAirlines();
+
+// Costruisce un link di ricerca Aviasales per la rotta/data trovata
+function buildBookingUrl(origin, destination, departureDateISO, passengers) {
+  const d = new Date(departureDateISO);
+  const ddmm = String(d.getDate()).padStart(2, '0') + String(d.getMonth() + 1).padStart(2, '0');
+  const pax = Math.max(1, passengers || 1);
+  let url = `https://www.aviasales.com/search/${origin}${ddmm}${destination}${pax}`;
+  if (AVIASALES_MARKER) url += `?marker=${AVIASALES_MARKER}`;
+  return url;
+}
+
 // ---------- DB (file JSON locale, va bene per uso personale) ----------
 const db = await JSONFilePreset('monitors.json', { monitors: [] });
 
@@ -49,6 +79,9 @@ app.post('/api/monitors', async (req, res) => {
     lastChecked: null,
     foundPrice: null,
     foundDate: null,
+    airline: null,
+    airlineName: null,
+    bookingUrl: null,
     createdAt: new Date().toISOString()
   };
 
@@ -140,11 +173,17 @@ async function checkMonitor(monitor) {
       monitor.status = 'found';
       monitor.foundPrice = best.price;
       monitor.foundDate = best.departure_at?.slice(0, 10) || null;
+      monitor.airline = best.airline || null;
+      monitor.airlineName = airlineMap[best.airline] || best.airline || 'Compagnia sconosciuta';
+      monitor.bookingUrl = best.departure_at
+        ? buildBookingUrl(monitor.from, monitor.to, best.departure_at, monitor.pax)
+        : null;
 
       if (!wasAlreadyFound) {
         await notifyTelegram(
-          `✈️ Trovato ${monitor.from} → ${monitor.to} a €${best.price} ` +
+          `✈️ Trovato ${monitor.from} → ${monitor.to} a €${best.price} con ${monitor.airlineName} ` +
           `(partenza ${monitor.foundDate}). Tetto impostato: €${monitor.maxPrice}. ` +
+          `Prenota qui: ${monitor.bookingUrl}\n` +
           `Ricorda: prezzo del solo biglietto, non include eventuali bagagli in stiva.`
         );
       }
