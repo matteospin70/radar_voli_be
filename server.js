@@ -100,6 +100,7 @@ async function fetchDirectPrices(origin, destination, departMonth) {
   url.searchParams.set('origin', origin);
   url.searchParams.set('destination', destination);
   url.searchParams.set('depart_date', departMonth);
+  url.searchParams.set('currency', 'eur'); // senza questo, i prezzi arrivano in rubli (RUB) per default
   url.searchParams.set('token', TP_TOKEN);
 
   const resp = await fetch(url, {
