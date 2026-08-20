@@ -33,8 +33,12 @@ function buildBookingUrl(origin, destination, departureDateISO) {
   return `https://www.google.com/travel/flights?q=${query}`;
 }
 
-// ---------- DB (file JSON locale, va bene per uso personale) ----------
-const db = await JSONFilePreset('monitors.json', { monitors: [] });
+// ---------- DB (file JSON) ----------
+// Su Railway, DB_PATH deve puntare dentro il volume persistente (es. /data/monitors.json),
+// altrimenti i dati si perdono ad ogni redeploy. In locale va bene il default.
+const DB_PATH = process.env.DB_PATH || 'monitors.json';
+const db = await JSONFilePreset(DB_PATH, { monitors: [] });
+console.log(`Database: ${DB_PATH}`);
 
 // ---------- APP ----------
 const app = express();
