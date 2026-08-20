@@ -11,9 +11,11 @@ const TP_TOKEN = process.env.TRAVELPAYOUTS_TOKEN;
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Controllo una volta al giorno di default (pensato per il budget SerpApi;
-// se usi solo Travelpayouts puoi tranquillamente abbassarlo, es. a 6).
-const CHECK_INTERVAL_HOURS = parseInt(process.env.CHECK_INTERVAL_HOURS || '24', 10);
+// Ogni fonte ha la sua frequenza di controllo: quella gratuita (Travelpayouts) può
+// permettersi controlli più frequenti, quella a consumo (SerpApi) resta più diradata
+// per il budget di ricerche gratuite.
+const CHECK_INTERVAL_HOURS_FREE = parseInt(process.env.CHECK_INTERVAL_HOURS_FREE || '6', 10);
+const CHECK_INTERVAL_HOURS_PAY = parseInt(process.env.CHECK_INTERVAL_HOURS_PAY || '24', 10);
 
 // Quante date campionare nel periodo per ogni monitoraggio con fonte SerpApi
 // (con Travelpayouts non serve: quell'endpoint copre già un mese intero in 1 chiamata).
@@ -59,6 +61,38 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Ricerca aeroporti per nome città/aeroporto (autocompletamento) — usa l'endpoint
+// pubblico di Travelpayouts, non richiede token.
+app.get('/api/airports', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (q.length < 2) return res.json([]);
+
+  try {
+    const url = new URL('https://autocomplete.travelpayouts.com/places2');
+    url.searchParams.set('term', q);
+    url.searchParams.set('locale', 'it');
+    url.searchParams.append('types[]', 'airport');
+
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Autocomplete ha risposto ${resp.status}`);
+    const results = await resp.json();
+
+    const airports = (results || [])
+      .filter(r => r.type === 'airport' && r.code)
+      .map(r => ({
+        code: r.code,
+        name: r.name,
+        cityName: r.city_name || r.name,
+        countryName: r.country_name || ''
+      }));
+
+    res.json(airports);
+  } catch (err) {
+    console.error('Errore ricerca aeroporti:', err.message);
+    res.json([]); // fallisce in modo silenzioso: l'utente può sempre digitare il codice a mano
+  }
+});
+
 // Elenco dei monitoraggi
 app.get('/api/monitors', (req, res) => {
   res.json(db.data.monitors);
@@ -66,7 +100,7 @@ app.get('/api/monitors', (req, res) => {
 
 // Nuovo monitoraggio
 app.post('/api/monitors', async (req, res) => {
-  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDays, source, maxStops } = req.body;
+  const { from, to, start, end, pax, bags, maxPrice, tripType, stayDaysMin, stayDaysMax, source, maxStops } = req.body;
 
   if (!from || !to || !start || !end || !maxPrice) {
     return res.status(400).json({ error: 'Campi obbligatori mancanti (from, to, start, end, maxPrice).' });
@@ -76,8 +110,10 @@ app.post('/api/monitors', async (req, res) => {
   const isRoundTrip = tripType === 'round_trip';
   const stops = Number.isFinite(Number(maxStops)) ? Math.max(0, Number(maxStops)) : 0; // default: solo diretti
 
-  if (isRoundTrip && (!stayDays || stayDays < 1)) {
-    return res.status(400).json({ error: 'Per andata/ritorno indica i giorni di soggiorno (stayDays >= 1).' });
+  const sMin = Number(stayDaysMin);
+  const sMax = Number(stayDaysMax);
+  if (isRoundTrip && (!sMin || !sMax || sMin < 1 || sMax < sMin)) {
+    return res.status(400).json({ error: 'Per andata/ritorno indica un range valido di giorni di soggiorno (stayDaysMin >= 1, stayDaysMax >= stayDaysMin).' });
   }
   if (isRoundTrip && dataSource === 'travelpayouts') {
     return res.status(400).json({ error: 'L\'andata/ritorno è al momento supportata solo con la fonte "serpapi".' });
@@ -97,7 +133,8 @@ app.post('/api/monitors', async (req, res) => {
     maxPrice: Number(maxPrice),
     source: dataSource,     // 'travelpayouts' | 'serpapi'
     tripType: isRoundTrip ? 'round_trip' : 'one_way',
-    stayDays: isRoundTrip ? Number(stayDays) : null,
+    stayDaysMin: isRoundTrip ? sMin : null,
+    stayDaysMax: isRoundTrip ? sMax : null,
     maxStops: stops,        // 0 = solo voli diretti, >0 = scali ammessi
     status: 'waiting',      // 'waiting' | 'found'
     lastChecked: null,
@@ -283,25 +320,60 @@ async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers
   });
 }
 
+// Genera fino a maxSamples combinazioni (data di partenza, giorni di soggiorno),
+// distribuendo sia sulle date nel periodo sia sulle durate nel range indicato,
+// per riusare lo stesso budget di ricerche già impostato invece di moltiplicarlo.
+function sampleTripCombos(startStr, endStr, stayMin, stayMax, maxSamples) {
+  const dates = sampleDates(startStr, endStr, maxSamples);
+  const stayRange = stayMax - stayMin;
+
+  return dates.map((dateStr, i) => {
+    const stayDays = stayRange === 0
+      ? stayMin
+      : stayMin + Math.round((i * stayRange) / Math.max(1, dates.length - 1));
+    return { dateStr, stayDays };
+  });
+}
+
 async function checkSerpApi(monitor) {
-  const dates = sampleDates(monitor.start, monitor.end, MAX_DATE_SAMPLES);
   const isRoundTrip = monitor.tripType === 'round_trip';
   let best = null;
+  let datesSampled;
 
-  for (const dateStr of dates) {
-    let returnDateStr = null;
-    if (isRoundTrip) {
+  if (isRoundTrip) {
+    const combos = sampleTripCombos(monitor.start, monitor.end, monitor.stayDaysMin, monitor.stayDaysMax, MAX_DATE_SAMPLES);
+    const center = (monitor.stayDaysMin + monitor.stayDaysMax) / 2;
+    datesSampled = combos.map(c => `${c.dateStr} (+${c.stayDays}gg)`);
+
+    for (const { dateStr, stayDays } of combos) {
       const ret = new Date(dateStr);
-      ret.setDate(ret.getDate() + monitor.stayDays);
-      returnDateStr = ret.toISOString().slice(0, 10);
+      ret.setDate(ret.getDate() + stayDays);
+      const returnDateStr = ret.toISOString().slice(0, 10);
+
+      const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr, monitor.maxStops || 0);
+      for (const offer of offers) {
+        if (!best) { best = offer; continue; }
+        if (offer.price < best.price) { best = offer; continue; }
+        if (offer.price === best.price) {
+          const offerDist = Math.abs(stayDays - center);
+          const bestDays = best.return_at ? (new Date(best.return_at) - new Date(best.departure_at)) / 86400000 : 0;
+          const bestDist = Math.abs(bestDays - center);
+          if (offerDist < bestDist) best = offer;
+        }
+      }
     }
-    const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, returnDateStr, monitor.maxStops || 0);
-    for (const offer of offers) {
-      if (!best || offer.price < best.price) best = offer;
+  } else {
+    const dates = sampleDates(monitor.start, monitor.end, MAX_DATE_SAMPLES);
+    datesSampled = dates;
+    for (const dateStr of dates) {
+      const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax, null, monitor.maxStops || 0);
+      for (const offer of offers) {
+        if (!best || offer.price < best.price) best = offer;
+      }
     }
   }
 
-  return { best, datesSampled: dates };
+  return { best, datesSampled };
 }
 
 async function checkMonitor(monitor) {
@@ -351,9 +423,12 @@ async function checkMonitor(monitor) {
   await db.write();
 }
 
-async function checkAllMonitors() {
-  console.log(`[${new Date().toISOString()}] Controllo di ${db.data.monitors.length} monitoraggi...`);
-  for (const monitor of db.data.monitors) {
+async function checkAllMonitors(sourceFilter) {
+  const targets = sourceFilter
+    ? db.data.monitors.filter(m => m.source === sourceFilter)
+    : db.data.monitors;
+  console.log(`[${new Date().toISOString()}] Controllo di ${targets.length} monitoraggi${sourceFilter ? ` (fonte: ${sourceFilter})` : ''}...`);
+  for (const monitor of targets) {
     await checkMonitor(monitor);
   }
 }
@@ -375,12 +450,15 @@ async function notifyTelegram(text) {
 }
 
 // ---------- SCHEDULER ----------
-// Esegue il controllo ogni CHECK_INTERVAL_HOURS ore (default 6)
-cron.schedule(`0 */${CHECK_INTERVAL_HOURS} * * *`, () => {
-  checkAllMonitors().catch(err => console.error('Errore nel controllo schedulato:', err));
+// Due job separati: uno per la fonte gratuita, uno per quella a pagamento, ognuno con la propria frequenza.
+cron.schedule(`0 */${CHECK_INTERVAL_HOURS_FREE} * * *`, () => {
+  checkAllMonitors('travelpayouts').catch(err => console.error('Errore nel controllo schedulato (travelpayouts):', err));
+});
+cron.schedule(`0 */${CHECK_INTERVAL_HOURS_PAY} * * *`, () => {
+  checkAllMonitors('serpapi').catch(err => console.error('Errore nel controllo schedulato (serpapi):', err));
 });
 
 app.listen(PORT, () => {
   console.log(`Radar Voli backend attivo sulla porta ${PORT}`);
-  console.log(`Controllo automatico ogni ${CHECK_INTERVAL_HOURS} ore.`);
+  console.log(`Controllo automatico: Travelpayouts ogni ${CHECK_INTERVAL_HOURS_FREE}h, SerpApi ogni ${CHECK_INTERVAL_HOURS_PAY}h.`);
 });
