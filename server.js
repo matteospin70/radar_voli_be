@@ -6,43 +6,36 @@ import { JSONFilePreset } from 'lowdb/node';
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
-const TP_TOKEN = process.env.TRAVELPAYOUTS_TOKEN;
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const CHECK_INTERVAL_HOURS = parseInt(process.env.CHECK_INTERVAL_HOURS || '6', 10);
 
-if (!TP_TOKEN) {
-  console.warn('[ATTENZIONE] TRAVELPAYOUTS_TOKEN non impostato: le chiamate falliranno.');
+// Controllo una volta al giorno di default: con Google Flights (a differenza di
+// Travelpayouts) ogni data interrogata è una ricerca a pagamento, quindi qui
+// il default è più conservativo per restare nel piano gratuito di SerpApi.
+const CHECK_INTERVAL_HOURS = parseInt(process.env.CHECK_INTERVAL_HOURS || '24', 10);
+
+// Quante date campionare all'interno del periodo indicato in ogni monitoraggio,
+// ad ogni controllo. Più alto = copertura migliore del periodo, ma più ricerche
+// consumate. Con MAX_DATE_SAMPLES=3 e un controllo al giorno, un monitoraggio
+// consuma ~90 ricerche/mese; il piano gratuito SerpApi ne offre circa 100-250/mese
+// (verifica il numero esatto sul tuo account) — quindi tienilo basso se hai più
+// di un monitoraggio attivo insieme.
+const MAX_DATE_SAMPLES = parseInt(process.env.MAX_DATE_SAMPLES || '3', 10);
+
+if (!SERPAPI_KEY) {
+  console.warn('[ATTENZIONE] SERPAPI_KEY non impostato: le chiamate falliranno.');
 }
 
 // Marker affiliato Travelpayouts (opzionale): se lo imposti, i link di acquisto
 // vengono tracciati sul tuo account. Senza, i link funzionano comunque lo stesso.
 const AVIASALES_MARKER = process.env.AVIASALES_MARKER || '';
 
-// ---------- MAPPA COMPAGNIE AEREE (nome per esteso a partire dal codice IATA) ----------
-let airlineMap = {};
-async function loadAirlines() {
-  try {
-    const resp = await fetch('https://api.travelpayouts.com/data/en/airlines.json');
-    const list = await resp.json();
-    for (const a of list) {
-      if (a.iata) airlineMap[a.iata] = a.name;
-    }
-    console.log(`Caricate ${Object.keys(airlineMap).length} compagnie aeree.`);
-  } catch (err) {
-    console.warn('Impossibile caricare la lista compagnie aeree:', err.message);
-  }
-}
-loadAirlines();
-
-// Costruisce un link di ricerca Aviasales per la rotta/data trovata
-function buildBookingUrl(origin, destination, departureDateISO, passengers) {
-  const d = new Date(departureDateISO);
-  const ddmm = String(d.getDate()).padStart(2, '0') + String(d.getMonth() + 1).padStart(2, '0');
-  const pax = Math.max(1, passengers || 1);
-  let url = `https://www.aviasales.com/search/${origin}${ddmm}${destination}${pax}`;
-  if (AVIASALES_MARKER) url += `?marker=${AVIASALES_MARKER}`;
-  return url;
+// Costruisce un link di ricerca Google Flights per la rotta/data trovata
+function buildBookingUrl(origin, destination, departureDateISO) {
+  const dateStr = departureDateISO.slice(0, 10); // YYYY-MM-DD
+  const query = encodeURIComponent(`Flights from ${origin} to ${destination} on ${dateStr}`);
+  return `https://www.google.com/travel/flights?q=${query}`;
 }
 
 // ---------- DB (file JSON locale, va bene per uso personale) ----------
@@ -77,6 +70,7 @@ app.post('/api/monitors', async (req, res) => {
     maxPrice: Number(maxPrice),
     status: 'waiting',      // 'waiting' | 'found'
     lastChecked: null,
+    datesSampled: [],
     foundPrice: null,
     foundDate: null,
     airline: null,
@@ -113,60 +107,86 @@ app.post('/api/monitors/check-now', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ---------- LOGICA DI CONTROLLO PREZZI ----------
+// ---------- LOGICA DI CONTROLLO PREZZI (SerpApi / Google Flights) ----------
 
-// Genera la lista di "YYYY-MM" compresi tra due date (Travelpayouts vuole il mese)
-function monthsBetween(startStr, endStr) {
+// Sceglie fino a maxSamples date distribuite uniformemente nel periodo indicato,
+// per non dover interrogare ogni singolo giorno (ogni data = 1 ricerca a pagamento).
+function sampleDates(startStr, endStr, maxSamples) {
   const start = new Date(startStr);
   const end = new Date(endStr);
-  const months = [];
-  let cur = new Date(start.getFullYear(), start.getMonth(), 1);
-  while (cur <= end) {
-    months.push(`${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}`);
-    cur.setMonth(cur.getMonth() + 1);
+  const totalDays = Math.max(1, Math.round((end - start) / 86400000) + 1);
+
+  if (totalDays <= maxSamples) {
+    const dates = [];
+    for (let i = 0; i < totalDays; i++) {
+      const d = new Date(start);
+      d.setDate(d.getDate() + i);
+      dates.push(d.toISOString().slice(0, 10));
+    }
+    return dates;
   }
-  return months;
+
+  const dates = [];
+  for (let i = 0; i < maxSamples; i++) {
+    const offset = Math.round((i * (totalDays - 1)) / (maxSamples - 1 || 1));
+    const d = new Date(start);
+    d.setDate(d.getDate() + offset);
+    dates.push(d.toISOString().slice(0, 10));
+  }
+  return [...new Set(dates)];
 }
 
-async function fetchDirectPrices(origin, destination, departMonth) {
-  const url = new URL('https://api.travelpayouts.com/v1/prices/direct');
-  url.searchParams.set('origin', origin);
-  url.searchParams.set('destination', destination);
-  url.searchParams.set('depart_date', departMonth);
-  url.searchParams.set('currency', 'eur'); // senza questo, i prezzi arrivano in rubli (RUB) per default
-  url.searchParams.set('token', TP_TOKEN);
+// Interroga Google Flights (via SerpApi) per una singola data e restituisce
+// solo le offerte di voli diretti (senza scali).
+async function fetchGoogleFlightsDirect(origin, destination, dateStr, passengers) {
+  const url = new URL('https://serpapi.com/search.json');
+  url.searchParams.set('engine', 'google_flights');
+  url.searchParams.set('departure_id', origin);
+  url.searchParams.set('arrival_id', destination);
+  url.searchParams.set('outbound_date', dateStr);
+  url.searchParams.set('type', '2'); // sola andata
+  url.searchParams.set('currency', 'EUR');
+  url.searchParams.set('hl', 'it');
+  url.searchParams.set('adults', String(Math.max(1, passengers || 1)));
+  url.searchParams.set('api_key', SERPAPI_KEY);
 
-  const resp = await fetch(url, {
-    headers: { 'X-Access-Token': TP_TOKEN }
-  });
-
+  const resp = await fetch(url);
   if (!resp.ok) {
-    throw new Error(`Travelpayouts ha risposto ${resp.status}`);
+    throw new Error(`SerpApi ha risposto ${resp.status}`);
   }
   const json = await resp.json();
-  if (!json.success) return [];
+  if (json.error) {
+    throw new Error(json.error);
+  }
 
-  // La risposta è tipicamente { data: { <destination>: { "0": {price, departure_at, ...}, ... } } }
-  const entries = json.data?.[destination];
-  if (!entries) return [];
-  return Object.values(entries);
+  const all = [...(json.best_flights || []), ...(json.other_flights || [])];
+  const direct = all.filter(offer => (offer.flights || []).length === 1);
+
+  return direct.map(offer => {
+    const leg = offer.flights[0];
+    return {
+      price: offer.price,
+      airline: leg.airline,
+      flight_number: leg.flight_number,
+      departure_at: `${dateStr}T${(leg.departure_airport?.time || '00:00').split(' ').pop()}:00Z`
+    };
+  });
 }
 
 async function checkMonitor(monitor) {
   try {
-    const months = monthsBetween(monitor.start, monitor.end);
+    const dates = sampleDates(monitor.start, monitor.end, MAX_DATE_SAMPLES);
     let best = null;
 
-    for (const month of months) {
-      const offers = await fetchDirectPrices(monitor.from, monitor.to, month);
+    for (const dateStr of dates) {
+      const offers = await fetchGoogleFlightsDirect(monitor.from, monitor.to, dateStr, monitor.pax);
       for (const offer of offers) {
-        const depDate = offer.departure_at?.slice(0, 10);
-        if (!depDate || depDate < monitor.start || depDate > monitor.end) continue;
         if (!best || offer.price < best.price) best = offer;
       }
     }
 
     monitor.lastChecked = new Date().toISOString();
+    monitor.datesSampled = dates; // utile per capire quali date sono state effettivamente controllate
 
     if (best && best.price <= monitor.maxPrice) {
       const wasAlreadyFound = monitor.status === 'found';
@@ -174,17 +194,18 @@ async function checkMonitor(monitor) {
       monitor.foundPrice = best.price;
       monitor.foundDate = best.departure_at?.slice(0, 10) || null;
       monitor.airline = best.airline || null;
-      monitor.airlineName = airlineMap[best.airline] || best.airline || 'Compagnia sconosciuta';
+      monitor.airlineName = best.airline || 'Compagnia sconosciuta';
       monitor.bookingUrl = best.departure_at
-        ? buildBookingUrl(monitor.from, monitor.to, best.departure_at, monitor.pax)
+        ? buildBookingUrl(monitor.from, monitor.to, best.departure_at)
         : null;
 
       if (!wasAlreadyFound) {
         await notifyTelegram(
           `✈️ Trovato ${monitor.from} → ${monitor.to} a €${best.price} con ${monitor.airlineName} ` +
           `(partenza ${monitor.foundDate}). Tetto impostato: €${monitor.maxPrice}. ` +
-          `Prenota qui: ${monitor.bookingUrl}\n` +
-          `Ricorda: prezzo del solo biglietto, non include eventuali bagagli in stiva.`
+          `Verifica e prenota qui: ${monitor.bookingUrl}\n` +
+          `Nota: abbiamo controllato solo alcune date campione nel periodo (${dates.join(', ')}), ` +
+          `non ogni singolo giorno, e il prezzo del solo biglietto non include eventuali bagagli in stiva.`
         );
       }
     } else {
